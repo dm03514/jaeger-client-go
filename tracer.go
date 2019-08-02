@@ -205,14 +205,54 @@ func (t *Tracer) StartSpan(
 	return t.startSpanWithOptions(operationName, sso)
 }
 
-func (t *Tracer) startSpanWithOptions(
+func (t *Tracer) StartSpanFromContext(
 	operationName string,
-	options opentracing.StartSpanOptions,
+	ctx SpanContext,
+	options ...opentracing.StartSpanOption,
 ) opentracing.Span {
-	if options.StartTime.IsZero() {
-		options.StartTime = t.timeNow()
+	sso := opentracing.StartSpanOptions{}
+	for _, o := range options {
+		o.Apply(&sso)
 	}
 
+	sp := t.newSpan()
+	sp.context = ctx
+
+	rpcServer := false
+	if v, ok := sso.Tags[ext.SpanKindRPCServer.Key]; ok {
+		rpcServer = (v == ext.SpanKindRPCServerEnum || v == string(ext.SpanKindRPCServerEnum))
+	}
+
+	// It's not possible to debug because there is no path to creating a SpanContext
+	// with debug from an end client.
+	var samplerTags []Tag
+	if sampled, tags := t.sampler.IsSampled(ctx.traceID, operationName); sampled {
+		ctx.flags |= flagSampled
+		samplerTags = tags
+	}
+
+	hasParent, parent, references := t.filterReferences(sso)
+
+	// determine if this is a new trace by checking to see if it has a parent
+	newTrace := false
+	if !hasParent || !parent.IsValid() {
+		newTrace = true
+	}
+
+	sp.observer = t.observer.OnStartSpan(sp, operationName, sso)
+	return t.startSpanInternal(
+		sp,
+		operationName,
+		sso.StartTime,
+		samplerTags,
+		sso.Tags,
+		newTrace,
+		rpcServer,
+		references,
+	)
+}
+
+func (t *Tracer) filterReferences(options opentracing.StartSpanOptions) (bool, SpanContext, []Reference) {
 	// Predicate whether the given span context is a valid reference
 	// which may be used as parent / debug ID / baggage items source
 	isValidReference := func(ctx SpanContext) bool {
@@ -239,11 +279,25 @@ func (t *Tracer) startSpanWithOptions(
 			hasParent = ref.Type == opentracing.ChildOfRef
 		}
 	}
+
 	if !hasParent && isValidReference(parent) {
 		// If ChildOfRef wasn't found but a FollowFromRef exists, use the context from
 		// the FollowFromRef as the parent
 		hasParent = true
 	}
+
+	return hasParent, parent, references
+}
+
+func (t *Tracer) startSpanWithOptions(
+	operationName string,
+	options opentracing.StartSpanOptions,
+) opentracing.Span {
+	if options.StartTime.IsZero() {
+		options.StartTime = t.timeNow()
+	}
+
+	hasParent, parent, references := t.filterReferences(options)
 
 	rpcServer := false
 	if v, ok := options.Tags[ext.SpanKindRPCServer.Key]; ok {
@@ -293,6 +347,7 @@ func (t *Tracer) startSpanWithOptions(
 
 	sp := t.newSpan()
 	sp.context = ctx
+
 	sp.observer = t.observer.OnStartSpan(sp, operationName, options)
 	return t.startSpanInternal(
 		sp,
